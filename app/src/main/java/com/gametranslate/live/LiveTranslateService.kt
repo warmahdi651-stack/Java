@@ -167,8 +167,18 @@ class LiveTranslateService : Service() {
             image.close()
             val frame = bitmap
             recognizer.process(InputImage.fromBitmap(frame, 0))
-                .addOnSuccessListener { result -> handleRecognizedText(result, frame) }
-                .addOnFailureListener { busy = false }
+                .addOnSuccessListener { result ->
+                    try {
+                        handleRecognizedText(result, frame)
+                    } catch (_: Exception) {
+                        if (!frame.isRecycled) frame.recycle()
+                        busy = false
+                    }
+                }
+                .addOnFailureListener {
+                    if (!frame.isRecycled) frame.recycle()
+                    busy = false
+                }
         } catch (_: Exception) {
             try { image.close() } catch (_: Exception) {}
             bitmap?.recycle()
@@ -186,7 +196,7 @@ class LiveTranslateService : Service() {
 
         if (blocks.isEmpty()) {
             lastFrameSignature = ""
-            handler.post { translatedItems.clear(); overlay?.setItems(emptyList()) }
+            handler.post { translatedItems.clear(); overlay?.setItems(emptyList(), frame.width, frame.height) }
             frame.recycle()
             busy = false
             return
@@ -212,7 +222,7 @@ class LiveTranslateService : Service() {
                 handler.post {
                     translatedItems.clear()
                     results.forEachIndexed { index, item -> translatedItems[index.toString()] = item }
-                    overlay?.setItems(results)
+                    overlay?.setItems(results, frame.width, frame.height)
                 }
                 frame.recycle()
                 busy = false
@@ -300,8 +310,7 @@ class LiveTranslateService : Service() {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply { gravity = Gravity.TOP or Gravity.START }
         try {
@@ -339,11 +348,15 @@ private class TranslationOverlayView(context: Context) : View(context) {
         textAlign = Paint.Align.CENTER
         typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL)
     }
-    private var items: List<OverlayItem> = emptyList()
-    private var status: String? = null
+    @Volatile private var items: List<OverlayItem> = emptyList()
+    private var sourceWidth = 1
+    private var sourceHeight = 1
+    @Volatile private var status: String? = null
 
-    fun setItems(value: List<OverlayItem>) {
-        items = value
+    fun setItems(value: List<OverlayItem>, frameWidth: Int, frameHeight: Int) {
+        items = value.toList()
+        sourceWidth = max(1, frameWidth)
+        sourceHeight = max(1, frameHeight)
         status = null
         invalidate()
     }
@@ -366,6 +379,10 @@ private class TranslationOverlayView(context: Context) : View(context) {
             return
         }
 
+        val scaleX = width.toFloat() / sourceWidth.toFloat()
+        val scaleY = height.toFloat() / sourceHeight.toFloat()
+        canvas.save()
+        canvas.scale(scaleX, scaleY)
         items.forEach { item ->
             val source = item.bounds
             val padX = max(7f, source.height() * 0.12f)
@@ -394,6 +411,7 @@ private class TranslationOverlayView(context: Context) : View(context) {
             layout.draw(canvas)
             canvas.restore()
         }
+        canvas.restore()
     }
 
     private fun luminance(color: Int): Double {
