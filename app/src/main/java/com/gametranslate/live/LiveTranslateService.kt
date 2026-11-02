@@ -1,200 +1,378 @@
 package com.gametranslate.live
 
-import android.app.*
+import android.app.Activity
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.Rect
+import android.graphics.RectF
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
-import android.os.*
+import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
 import android.provider.Settings
 import android.view.Gravity
+import android.view.View
 import android.view.WindowManager
-import android.widget.TextView
+import android.text.Layout
+import android.text.StaticLayout
+import android.text.TextPaint
+import android.text.TextDirectionHeuristics
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
-import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
-import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
-import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
-import com.google.mlkit.vision.text.devanagari.DevanagariTextRecognizerOptions
-import com.google.mlkit.nl.languageid.LanguageIdentification
 import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
+import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
 import java.nio.ByteBuffer
+import java.util.LinkedHashMap
+import kotlin.math.max
+import kotlin.math.min
+
+private data class OverlayItem(val bounds: RectF, val translated: String, val background: Int)
 
 class LiveTranslateService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private var projection: MediaProjection? = null
     private var display: VirtualDisplay? = null
     private var reader: ImageReader? = null
-    private var overlay: TextView? = null
-    private var lastText = ""
+    private var overlay: TranslationOverlayView? = null
+    private lateinit var recognizer: TextRecognizer
+    private var translator: Translator? = null
     private var busy = false
-    private lateinit var recognizers: List<TextRecognizer>
-    private val languageId by lazy { LanguageIdentification.getClient() }
-    private var lastTranslateAt = 0L
+    private var lastCaptureAt = 0L
+    private var lastFrameSignature = ""
+    private val cache = object : LinkedHashMap<String, String>(100, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?) = size > 250
+    }
+    private val translatedItems = LinkedHashMap<String, OverlayItem>()
 
-    override fun onBind(intent: Intent?) = null
+    override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
-        recognizers = listOf(
-            TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS),
-            TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build()),
-            TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build()),
-            TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build()),
-            TextRecognition.getClient(DevanagariTextRecognizerOptions.Builder().build())
-        )
+        recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        val options = TranslatorOptions.Builder()
+            .setSourceLanguage(TranslateLanguage.ENGLISH)
+            .setTargetLanguage(TranslateLanguage.PERSIAN)
+            .build()
+        translator = Translation.getClient(options)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         createNotification()
         if (projection == null) {
             val code = intent?.getIntExtra("resultCode", Activity.RESULT_CANCELED) ?: Activity.RESULT_CANCELED
-            val data = if (Build.VERSION.SDK_INT >= 33) intent?.getParcelableExtra("projectionData", Intent::class.java)
-                else @Suppress("DEPRECATION") (intent?.getParcelableExtra("projectionData") as? Intent)
-            if (code != Activity.RESULT_OK || data == null) { stopSelf(); return START_NOT_STICKY }
-            val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            projection = mgr.getMediaProjection(code, data)
+            val data = if (Build.VERSION.SDK_INT >= 33) {
+                intent?.getParcelableExtra("projectionData", Intent::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                (intent?.getParcelableExtra("projectionData") as? Intent)
+            }
+            if (code != Activity.RESULT_OK || data == null) {
+                stopSelf()
+                return START_NOT_STICKY
+            }
+            val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            projection = manager.getMediaProjection(code, data)
             projection?.registerCallback(object : MediaProjection.Callback() {
                 override fun onStop() { stopSelf() }
             }, handler)
             startCapture()
-            showOverlay("GameTranslate روشن شد؛ نوشته‌های بازی را بررسی می‌کنم…")
+            showStatus("در حال آماده‌سازی مترجم…")
+            prepareTranslationModel()
         }
         return START_NOT_STICKY
     }
 
     private fun createNotification() {
-        val channel = "gametranslate_live"
+        val channelId = "gametranslate_live"
         if (Build.VERSION.SDK_INT >= 26) {
-            val c = NotificationChannel(channel, "ترجمه زنده بازی", NotificationManager.IMPORTANCE_LOW)
-            getSystemService(NotificationManager::class.java).createNotificationChannel(c)
+            val channel = NotificationChannel(channelId, "ترجمه زنده بازی", NotificationManager.IMPORTANCE_LOW)
+            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
-        val n = Notification.Builder(this, channel)
-            .setContentTitle("GameTranslate فعال است")
-            .setContentText("برای توقف، برنامه را باز کن.")
-            .setSmallIcon(android.R.drawable.ic_menu_search).build()
-        startForeground(77, n)
+        val notification = if (Build.VERSION.SDK_INT >= 26) {
+            Notification.Builder(this, channelId)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+        }.setContentTitle("GameTranslate فعال است")
+            .setContentText("ترجمه روی نوشته‌های بازی نمایش داده می‌شود.")
+            .setSmallIcon(android.R.drawable.ic_menu_search)
+            .build()
+        startForeground(77, notification)
+    }
+
+    private fun prepareTranslationModel() {
+        translator?.downloadModelIfNeeded()
+            ?.addOnSuccessListener { showStatus("آماده است؛ متن انگلیسی بازی را ترجمه می‌کنم.") }
+            ?.addOnFailureListener { showStatus("برای دریافت مدل ترجمه، اینترنت را روشن کن.") }
     }
 
     private fun startCapture() {
-        val dm = resources.displayMetrics
-        reader = ImageReader.newInstance(dm.widthPixels, dm.heightPixels, PixelFormat.RGBA_8888, 2)
-        reader?.setOnImageAvailableListener({ r ->
-            val image = r.acquireLatestImage() ?: return@setOnImageAvailableListener
-            if (!busy && System.currentTimeMillis() - lastTranslateAt > 1600) {
+        val metrics = resources.displayMetrics
+        reader = ImageReader.newInstance(metrics.widthPixels, metrics.heightPixels, PixelFormat.RGBA_8888, 3)
+        reader?.setOnImageAvailableListener({ source ->
+            val image = source.acquireLatestImage() ?: return@setOnImageAvailableListener
+            val now = System.currentTimeMillis()
+            if (!busy && now - lastCaptureAt >= 450) {
                 busy = true
-                lastTranslateAt = System.currentTimeMillis()
-                processImage(image)
-            } else image.close()
+                lastCaptureAt = now
+                processFrame(image)
+            } else {
+                image.close()
+            }
         }, handler)
         display = projection?.createVirtualDisplay(
-            "GameTranslateCapture", dm.widthPixels, dm.heightPixels, dm.densityDpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader?.surface, null, handler
+            "GameTranslateCapture",
+            metrics.widthPixels,
+            metrics.heightPixels,
+            metrics.densityDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            reader?.surface,
+            null,
+            handler
         )
     }
 
-    private fun processImage(image: Image) {
-        var closed = false
+    private fun processFrame(image: Image) {
+        var bitmap: Bitmap? = null
         try {
-            val bitmap = imageToBitmap(image)
+            bitmap = imageToBitmap(image)
             image.close()
-            closed = true
-            val input = InputImage.fromBitmap(bitmap, 0)
-            recognizeWithFallback(input, 0) { detectedText ->
-                val text = detectedText.lines().map { it.trim() }.filter { it.length >= 2 }.take(8).joinToString("\n")
-                if (text.isBlank() || text == lastText) { busy = false; return@recognizeWithFallback }
-                lastText = text
-                languageId.identifyLanguage(text).addOnSuccessListener { lang ->
-                    if (lang == "und" || lang == "fa" || lang == "ar") { busy = false; return@addOnSuccessListener }
-                    val source = TranslateLanguage.fromLanguageTag(lang)
-                    val target = TranslateLanguage.PERSIAN
-                    if (source == null || source == target) { busy = false; return@addOnSuccessListener }
-                    val translator = Translation.getClient(
-                        TranslatorOptions.Builder().setSourceLanguage(source).setTargetLanguage(target).build()
-                    )
-                    translator.downloadModelIfNeeded().addOnSuccessListener {
-                        translator.translate(text).addOnSuccessListener { translated ->
-                            showOverlay(translated)
-                            busy = false
-                            translator.close()
-                        }.addOnFailureListener { busy = false; translator.close() }
-                    }.addOnFailureListener {
-                        busy = false
-                        translator.close()
-                        showOverlay("برای دریافت مدل زبان، اینترنت را روشن کن.")
-                    }
-                }.addOnFailureListener { busy = false }
-            }
+            val frame = bitmap
+            recognizer.process(InputImage.fromBitmap(frame, 0))
+                .addOnSuccessListener { result -> handleRecognizedText(result, frame) }
+                .addOnFailureListener { busy = false }
         } catch (_: Exception) {
-            if (!closed) image.close()
+            try { image.close() } catch (_: Exception) {}
+            bitmap?.recycle()
             busy = false
         }
     }
 
-    private fun recognizeWithFallback(input: InputImage, index: Int, done: (String) -> Unit) {
-        if (index >= recognizers.size) { done(""); return }
-        recognizers[index].process(input)
-            .addOnSuccessListener { result ->
-                if (result.text.isNotBlank()) done(result.text)
-                else recognizeWithFallback(input, index + 1, done)
+    private fun handleRecognizedText(result: Text, frame: Bitmap) {
+        val blocks = result.textBlocks.mapNotNull { block ->
+            val box = block.boundingBox ?: return@mapNotNull null
+            val value = block.text.trim()
+            if (value.length < 2 || !value.any { it.isLetter() }) null
+            else Triple(value, Rect(box), backgroundColor(frame, box))
+        }.take(12)
+
+        if (blocks.isEmpty()) {
+            handler.post { translatedItems.clear(); overlay?.setItems(emptyList()) }
+            frame.recycle()
+            busy = false
+            return
+        }
+
+        val signature = blocks.joinToString("|") { it.first }
+        if (signature == lastFrameSignature) {
+            frame.recycle()
+            busy = false
+            return
+        }
+        lastFrameSignature = signature
+
+        val pending = blocks.size
+        var completed = 0
+        val results = mutableListOf<OverlayItem>()
+        fun finishOne() {
+            completed++
+            if (completed >= pending) {
+                handler.post {
+                    translatedItems.clear()
+                    results.forEachIndexed { index, item -> translatedItems[index.toString()] = item }
+                    overlay?.setItems(results)
+                }
+                frame.recycle()
+                busy = false
             }
-            .addOnFailureListener { recognizeWithFallback(input, index + 1, done) }
+        }
+
+        blocks.forEach { (sourceText, bounds, bg) ->
+            val cached = synchronized(cache) { cache[sourceText] }
+            if (cached != null) {
+                results.add(OverlayItem(RectF(bounds), cached, bg))
+                finishOne()
+            } else {
+                translator?.translate(sourceText)
+                    ?.addOnSuccessListener { translated ->
+                        synchronized(cache) { cache[sourceText] = translated }
+                        results.add(OverlayItem(RectF(bounds), translated, bg))
+                        finishOne()
+                    }
+                    ?.addOnFailureListener { finishOne() }
+                    ?: finishOne()
+            }
+        }
     }
 
-    private fun imageToBitmap(image: Image): android.graphics.Bitmap {
+    private fun backgroundColor(bitmap: Bitmap, box: Rect): Int {
+        val points = listOf(
+            box.left - 3 to box.top - 3,
+            box.right + 3 to box.top - 3,
+            box.left - 3 to box.bottom + 3,
+            box.right + 3 to box.bottom + 3
+        )
+        var red = 0
+        var green = 0
+        var blue = 0
+        var count = 0
+        points.forEach { (x, y) ->
+            if (x in 0 until bitmap.width && y in 0 until bitmap.height) {
+                val color = bitmap.getPixel(x, y)
+                red += Color.red(color)
+                green += Color.green(color)
+                blue += Color.blue(color)
+                count++
+            }
+        }
+        if (count == 0) return Color.rgb(28, 28, 28)
+        return Color.rgb(red / count, green / count, blue / count)
+    }
+
+    private fun imageToBitmap(image: Image): Bitmap {
         val plane = image.planes[0]
         val buffer: ByteBuffer = plane.buffer
         val pixelStride = plane.pixelStride
         val rowStride = plane.rowStride
         val rowPadding = rowStride - pixelStride * image.width
-        val padded = android.graphics.Bitmap.createBitmap(
-            image.width + rowPadding / pixelStride, image.height, android.graphics.Bitmap.Config.ARGB_8888
+        val padded = Bitmap.createBitmap(
+            image.width + rowPadding / pixelStride,
+            image.height,
+            Bitmap.Config.ARGB_8888
         )
+        buffer.rewind()
         padded.copyPixelsFromBuffer(buffer)
-        return android.graphics.Bitmap.createBitmap(padded, 0, 0, image.width, image.height)
+        val result = Bitmap.createBitmap(padded, 0, 0, image.width, image.height)
+        padded.recycle()
+        return result
     }
 
-    private fun showOverlay(text: String) {
+    private fun ensureOverlay() {
+        if (overlay != null || !Settings.canDrawOverlays(this)) return
+        val view = TranslationOverlayView(this)
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START }
+        try {
+            (getSystemService(WINDOW_SERVICE) as WindowManager).addView(view, params)
+            overlay = view
+        } catch (_: Exception) { overlay = null }
+    }
+
+    private fun showStatus(message: String) {
         handler.post {
-            if (!Settings.canDrawOverlays(this)) return@post
-            if (overlay == null) {
-                overlay = TextView(this).apply {
-                    setTextColor(0xFFFFFFFF.toInt())
-                    setBackgroundColor(0xDD111827.toInt())
-                    textSize = 16f
-                    setPadding(18, 12, 18, 12)
-                    maxLines = 7
-                }
-                val params = WindowManager.LayoutParams(
-                    WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.WRAP_CONTENT,
-                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                    PixelFormat.TRANSLUCENT
-                ).apply { gravity = Gravity.TOP; y = 70 }
-                try { (getSystemService(WINDOW_SERVICE) as WindowManager).addView(overlay, params) }
-                catch (_: Exception) { overlay = null }
-            }
-            overlay?.text = "ترجمه: $text"
+            ensureOverlay()
+            overlay?.setStatus(message)
         }
     }
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
-        try { overlay?.let { (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(it) } } catch (_: Exception) {}
+        try {
+            overlay?.let { (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(it) }
+        } catch (_: Exception) {}
+        overlay = null
         display?.release()
         reader?.close()
         projection?.stop()
-        recognizers.forEach { it.close() }
-        languageId.close()
+        recognizer.close()
+        translator?.close()
         super.onDestroy()
+    }
+}
+
+private class TranslationOverlayView(context: Context) : View(context) {
+    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val textPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textAlign = Paint.Align.CENTER
+        typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL)
+    }
+    private var items: List<OverlayItem> = emptyList()
+    private var status: String? = null
+
+    fun setItems(value: List<OverlayItem>) {
+        items = value
+        status = null
+        invalidate()
+    }
+
+    fun setStatus(value: String) {
+        status = value
+        items = emptyList()
+        invalidate()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val message = status
+        if (message != null) {
+            fillPaint.color = 0xCC151515.toInt()
+            val rect = RectF(24f, 70f, width - 24f, 132f)
+            canvas.drawRoundRect(rect, 12f, 12f, fillPaint)
+            textPaint.textSize = 22f
+            canvas.drawText(message, rect.centerX(), rect.centerY() + 8f, textPaint)
+            return
+        }
+
+        items.forEach { item ->
+            val source = item.bounds
+            val padX = max(7f, source.height() * 0.12f)
+            val padY = max(5f, source.height() * 0.10f)
+            val rect = RectF(
+                max(0f, source.left - padX),
+                max(0f, source.top - padY),
+                min(width.toFloat(), source.right + padX),
+                min(height.toFloat(), source.bottom + padY)
+            )
+            fillPaint.color = item.background
+            canvas.drawRect(rect, fillPaint)
+
+            val fontSize = max(14f, min(25f, source.height() * 0.72f))
+            textPaint.textSize = fontSize
+            textPaint.color = if (luminance(item.background) < 0.42) Color.WHITE else Color.BLACK
+            val layout = StaticLayout.Builder
+                .obtain(item.translated, 0, item.translated.length, textPaint, max(30, rect.width().toInt()))
+                .setAlignment(Layout.Alignment.ALIGN_CENTER)
+                .setTextDirection(TextDirectionHeuristics.RTL)
+                .setIncludePad(false)
+                .build()
+            canvas.save()
+            val verticalOffset = max(0f, (rect.height() - layout.height) / 2f)
+            canvas.translate(rect.left, rect.top + verticalOffset)
+            layout.draw(canvas)
+            canvas.restore()
+        }
+    }
+
+    private fun luminance(color: Int): Double {
+        return (0.2126 * Color.red(color) + 0.7152 * Color.green(color) + 0.0722 * Color.blue(color)) / 255.0
     }
 }
