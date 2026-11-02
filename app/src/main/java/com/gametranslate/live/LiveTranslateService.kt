@@ -57,6 +57,7 @@ class LiveTranslateService : Service() {
     private lateinit var recognizer: TextRecognizer
     private var translator: Translator? = null
     private var busy = false
+    @Volatile private var modelReady = false
     private var lastCaptureAt = 0L
     private var lastFrameSignature = ""
     private val cache = object : LinkedHashMap<String, String>(100, 0.75f, true) {
@@ -122,8 +123,15 @@ class LiveTranslateService : Service() {
 
     private fun prepareTranslationModel() {
         translator?.downloadModelIfNeeded()
-            ?.addOnSuccessListener { showStatus("آماده است؛ متن انگلیسی بازی را ترجمه می‌کنم.") }
-            ?.addOnFailureListener { showStatus("برای دریافت مدل ترجمه، اینترنت را روشن کن.") }
+            ?.addOnSuccessListener {
+                modelReady = true
+                lastCaptureAt = 0L
+                showStatus("آماده است؛ متن انگلیسی بازی را ترجمه می‌کنم.")
+            }
+            ?.addOnFailureListener {
+                modelReady = false
+                showStatus("دانلود مدل ترجمه ناموفق بود؛ اینترنت را بررسی کن و دوباره برنامه را اجرا کن.")
+            }
     }
 
     private fun startCapture() {
@@ -132,7 +140,7 @@ class LiveTranslateService : Service() {
         reader?.setOnImageAvailableListener({ source ->
             val image = source.acquireLatestImage() ?: return@setOnImageAvailableListener
             val now = System.currentTimeMillis()
-            if (!busy && now - lastCaptureAt >= 450) {
+            if (!busy && modelReady && now - lastCaptureAt >= 550) {
                 busy = true
                 lastCaptureAt = now
                 processFrame(image)
@@ -177,13 +185,17 @@ class LiveTranslateService : Service() {
         }.take(12)
 
         if (blocks.isEmpty()) {
+            lastFrameSignature = ""
             handler.post { translatedItems.clear(); overlay?.setItems(emptyList()) }
             frame.recycle()
             busy = false
             return
         }
 
-        val signature = blocks.joinToString("|") { it.first }
+        // Include position and size so identical text moving on screen also moves its overlay.
+        val signature = blocks.joinToString("|") {
+            it.first + "@" + it.second.left + "," + it.second.top + "," + it.second.right + "," + it.second.bottom
+        }
         if (signature == lastFrameSignature) {
             frame.recycle()
             busy = false
@@ -226,27 +238,39 @@ class LiveTranslateService : Service() {
     }
 
     private fun backgroundColor(bitmap: Bitmap, box: Rect): Int {
-        val points = listOf(
-            box.left - 3 to box.top - 3,
-            box.right + 3 to box.top - 3,
-            box.left - 3 to box.bottom + 3,
-            box.right + 3 to box.bottom + 3
-        )
-        var red = 0
-        var green = 0
-        var blue = 0
-        var count = 0
-        points.forEach { (x, y) ->
-            if (x in 0 until bitmap.width && y in 0 until bitmap.height) {
-                val color = bitmap.getPixel(x, y)
-                red += Color.red(color)
-                green += Color.green(color)
-                blue += Color.blue(color)
-                count++
-            }
+        // Sample a thin perimeter rather than only four corners; median values
+        // reduce the influence of bright glyph pixels and isolated UI details.
+        val samples = ArrayList<Int>(64)
+        val left = max(0, box.left - 4)
+        val right = min(bitmap.width - 1, box.right + 4)
+        val top = max(0, box.top - 4)
+        val bottom = min(bitmap.height - 1, box.bottom + 4)
+        if (right < left || bottom < top) return Color.rgb(28, 28, 28)
+
+        val stepX = max(1, (right - left) / 24)
+        val stepY = max(1, (bottom - top) / 12)
+        var x = left
+        while (x <= right) {
+            if (top < box.top) samples.add(bitmap.getPixel(x, top))
+            if (bottom > box.bottom && bottom != top) samples.add(bitmap.getPixel(x, bottom))
+            x += stepX
         }
-        if (count == 0) return Color.rgb(28, 28, 28)
-        return Color.rgb(red / count, green / count, blue / count)
+        var y = top
+        while (y <= bottom) {
+            if (left < box.left) samples.add(bitmap.getPixel(left, y))
+            if (right > box.right && right != left) samples.add(bitmap.getPixel(right, y))
+            y += stepY
+        }
+        if (samples.isEmpty()) return Color.rgb(28, 28, 28)
+        fun median(channel: (Int) -> Int): Int {
+            val values = samples.map(channel).sorted()
+            return values[values.size / 2]
+        }
+        return Color.rgb(
+            median { Color.red(it) },
+            median { Color.green(it) },
+            median { Color.blue(it) }
+        )
     }
 
     private fun imageToBitmap(image: Image): Bitmap {
