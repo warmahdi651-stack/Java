@@ -204,7 +204,7 @@ class LiveTranslateService : Service() {
 
         // Include position and size so identical text moving on screen also moves its overlay.
         val signature = blocks.joinToString("|") {
-            it.first + "@" + it.second.left + "," + it.second.top + "," + it.second.right + "," + it.second.bottom
+            it.first + "@" + it.second.left + "," + it.second.top + "," + it.second.right + "," + it.second.bottom + "#" + it.third
         }
         if (signature == lastFrameSignature) {
             frame.recycle()
@@ -212,6 +212,7 @@ class LiveTranslateService : Service() {
             return
         }
         lastFrameSignature = signature
+        handler.post { overlay?.setItems(emptyList(), frame.width, frame.height) }
 
         val pending = blocks.size
         var completed = 0
