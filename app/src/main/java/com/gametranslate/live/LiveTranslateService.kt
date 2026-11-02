@@ -187,6 +187,8 @@ class LiveTranslateService : Service() {
     }
 
     private fun handleRecognizedText(result: Text, frame: Bitmap) {
+        val frameWidth = frame.width
+        val frameHeight = frame.height
         val blocks = result.textBlocks.mapNotNull { block ->
             val box = block.boundingBox ?: return@mapNotNull null
             val value = block.text.trim()
@@ -196,7 +198,7 @@ class LiveTranslateService : Service() {
 
         if (blocks.isEmpty()) {
             lastFrameSignature = ""
-            handler.post { translatedItems.clear(); overlay?.setItems(emptyList(), frame.width, frame.height) }
+            handler.post { translatedItems.clear(); overlay?.setItems(emptyList(), frameWidth, frameHeight) }
             frame.recycle()
             busy = false
             return
@@ -212,7 +214,7 @@ class LiveTranslateService : Service() {
             return
         }
         lastFrameSignature = signature
-        handler.post { overlay?.setItems(emptyList(), frame.width, frame.height) }
+        handler.post { overlay?.setItems(emptyList(), frameWidth, frameHeight) }
 
         val pending = blocks.size
         var completed = 0
@@ -223,7 +225,7 @@ class LiveTranslateService : Service() {
                 handler.post {
                     translatedItems.clear()
                     results.forEachIndexed { index, item -> translatedItems[index.toString()] = item }
-                    overlay?.setItems(results, frame.width, frame.height)
+                    overlay?.setItems(results, frameWidth, frameHeight)
                 }
                 frame.recycle()
                 busy = false
