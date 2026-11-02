@@ -189,12 +189,17 @@ class LiveTranslateService : Service() {
     private fun handleRecognizedText(result: Text, frame: Bitmap) {
         val frameWidth = frame.width
         val frameHeight = frame.height
-        val blocks = result.textBlocks.mapNotNull { block ->
-            val box = block.boundingBox ?: return@mapNotNull null
-            val value = block.text.trim()
-            if (value.length < 2 || !value.any { it.isLetter() }) null
-            else Triple(value, Rect(box), backgroundColor(frame, box))
-        }.take(12)
+        // Translate individual OCR lines, not whole paragraphs. This keeps
+        // overlay rectangles tight and prevents a large block from covering UI.
+        val blocks = result.textBlocks.flatMap { block ->
+            block.lines.mapNotNull { line ->
+                val box = line.boundingBox ?: return@mapNotNull null
+                val value = line.text.trim()
+                val latinLetters = value.count { it in 'A'..'Z' || it in 'a'..'z' }
+                if (latinLetters < 2) null
+                else Triple(value, Rect(box), backgroundColor(frame, box))
+            }
+        }.take(18)
 
         if (blocks.isEmpty()) {
             lastFrameSignature = ""
@@ -393,8 +398,8 @@ private class TranslationOverlayView(context: Context) : View(context) {
             val rect = RectF(
                 max(0f, source.left - padX),
                 max(0f, source.top - padY),
-                min(width.toFloat(), source.right + padX),
-                min(height.toFloat(), source.bottom + padY)
+                min(sourceWidth.toFloat(), source.right + padX),
+                min(sourceHeight.toFloat(), source.bottom + padY)
             )
             fillPaint.color = item.background
             canvas.drawRect(rect, fillPaint)
@@ -402,13 +407,25 @@ private class TranslationOverlayView(context: Context) : View(context) {
             val fontSize = max(14f, min(25f, source.height() * 0.72f))
             textPaint.textSize = fontSize
             textPaint.color = if (luminance(item.background) < 0.42) Color.WHITE else Color.BLACK
-            val layout = StaticLayout.Builder
-                .obtain(item.translated, 0, item.translated.length, textPaint, max(30, rect.width().toInt()))
+            val textWidth = max(30, rect.width().toInt())
+            var layout = StaticLayout.Builder
+                .obtain(item.translated, 0, item.translated.length, textPaint, textWidth)
                 .setAlignment(Layout.Alignment.ALIGN_CENTER)
                 .setTextDirection(TextDirectionHeuristics.RTL)
                 .setIncludePad(false)
                 .build()
+            // Long Persian translations must not spill over neighboring game UI.
+            while (layout.height > rect.height() && textPaint.textSize > 10f) {
+                textPaint.textSize = max(10f, textPaint.textSize - 1f)
+                layout = StaticLayout.Builder
+                    .obtain(item.translated, 0, item.translated.length, textPaint, textWidth)
+                    .setAlignment(Layout.Alignment.ALIGN_CENTER)
+                    .setTextDirection(TextDirectionHeuristics.RTL)
+                    .setIncludePad(false)
+                    .build()
+            }
             canvas.save()
+            canvas.clipRect(rect)
             val verticalOffset = max(0f, (rect.height() - layout.height) / 2f)
             canvas.translate(rect.left, rect.top + verticalOffset)
             layout.draw(canvas)
